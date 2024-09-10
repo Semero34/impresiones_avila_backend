@@ -1,6 +1,9 @@
+require('dotenv').config();  
 const express = require('express');
 const mysql = require('mysql2');
 const PDFDocument = require('pdfkit');
+const { Parser } = require('json2csv');
+const ExcelJS = require('exceljs');
 const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
@@ -11,17 +14,21 @@ const fileUpload = require('express-fileupload');
 const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const multer = require('multer'); 
+const cron = require('node-cron');
 const moment = require('moment');
-const fetch = require('node-fetch'); 
-const paypal = require('@paypal/checkout-server-sdk'); 
-require('dotenv').config();  
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const axios = require('axios');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const { OAuth2Client } = require('google-auth-library');
 
 
-const { PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PORT = 8888 } = process.env;
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+const YOUR_DOMAIN = process.env.YOUR_DOMAIN;
 const app = express();
-const base = "https://api-m.sandbox.paypal.com";
 const SECRET_KEY = 'amovertele';
 
+app.use(passport.initialize());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
@@ -54,12 +61,8 @@ db.connect(err => {
         console.error('Database connection error:', err);
         return;
     }
-    console.log('Database connConnected to the MySQL database on Clever Cloudcted');
+    console.log('Database connected');
 });
-
-const Environment = process.env.NODE_ENV === 'production' ? paypal.core.LiveEnvironment : paypal.core.SandboxEnvironment;
-const paypalClient = new paypal.core.PayPalHttpClient(new Environment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_CLIENT_SECRET));
-
 
 // Configuración de Nodemailer
 const transporter = nodemailer.createTransport({
@@ -69,6 +72,17 @@ const transporter = nodemailer.createTransport({
         pass: 'vknj wvob whqs hvuv'
     }
 });
+
+
+
+const generateRandomCode = (length = 8) => {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+};  
 
 const sendNotification = (userId, eventType, content) => {
     db.query('SELECT email FROM Users WHERE user_id = ?', [userId], (err, results) => {
@@ -104,95 +118,6 @@ const sendNotification = (userId, eventType, content) => {
     });
 };
 
-async function generateAccessToken() {
-    try {
-        const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
-
-        const response = await fetch(`${base}/v1/oauth2/token`, {
-            method: "POST",
-            headers: {
-                Authorization: `Basic ${auth}`,
-                'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            body: new URLSearchParams({
-                grant_type: "client_credentials"
-            }),
-        });
-
-        if (!response.ok) {
-            throw new Error(`PayPal token request failed: ${response.status} ${response.statusText}`);
-        }
-
-        const data = await response.json();
-        return data.access_token;
-    } catch (error) {
-        console.error('Error generating PayPal access token:', error);
-        // Aquí puedes manejar el error, lanzar una excepción o devolver un valor específico
-        throw error;  // Si quieres que el error se propague, de lo contrario maneja según tus necesidades
-    }
-}
-
-const createOrder = async (req, res) => {
-    try {
-        const { total, currency_code } = req.body;
-        const accessToken = await generateAccessToken();
-        const url = `${base}/v2/checkout/orders`;
-
-        const payload = {
-            intent: "CAPTURE",
-            purchase_units: [
-                {
-                    amount: {
-                        currency_code: currency_code || "USD",
-                        value: total
-                    }
-                }
-            ]
-        };
-
-        console.log('Creating order with payload:', payload);
-
-        const response = await fetch(url, {
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${accessToken}`
-            },
-            method: "POST",
-            body: JSON.stringify(payload)
-        });
-
-        const orderData = await response.json();
-        console.log('Order created:', orderData);
-
-        if (!orderData.id) {
-            throw new Error('Order creation failed: no order ID returned');
-        }
-
-        res.status(response.status).json(orderData);
-    } catch (error) {
-        console.error("Error creating PayPal order:", error);
-        res.status(500).json({ error: "Error creating PayPal order." });
-    }
-};
-
-const captureOrder = async (req, res) => {
-    const { orderID } = req.body;
-    const accessToken = await generateAccessToken();
-    const url = `${base}/v2/checkout/orders/${orderID}/capture`;
-
-    const response = await fetch(url, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`
-        }
-    });
-
-    const captureData = await response.json();
-    res.status(response.status).json(captureData);
-};
-
-
 const registerActivity = (userId, action, details) => {
     const query = 'INSERT INTO AuditLogs (user_id, action, details) VALUES (?, ?, ?)';
     db.query(query, [userId, action, details], (err, results) => {
@@ -201,11 +126,10 @@ const registerActivity = (userId, action, details) => {
         }
     });
 };
-//cod
 
-function verifySession(req, res, next) {
+const verifySession = (req, res, next) => {
     const token = req.headers['authorization']?.split(' ')[1];
-    console.log('Token recibido:', token);
+    console.log('Token recibido:', token); 
     if (!token) {
         return res.status(401).json({ message: 'Access token is missing or invalid' });
     }
@@ -224,14 +148,122 @@ function verifySession(req, res, next) {
             next();
         });
     });
-}
+};
 
-app.post("/api/orders", createOrder);
-app.post("/api/orders/:orderID/capture", captureOrder);
 
-app.get('/', (req, res) => {
-    res.send('Server is up and running');
+app.post('/google-login', async (req, res) => {
+    const { token } = req.body;
+
+    try {
+        const ticket = await client.verifyIdToken({
+            idToken: token,
+            audience: process.env.GOOGLE_CLIENT_ID,
+        });
+
+        const payload = ticket.getPayload();
+        const { sub, email, given_name = 'GoogleUser', family_name = 'GoogleLastName' } = payload; // Agregar valores por defecto
+
+        // Generar un username basado en el email
+        const username = email.split('@')[0];
+
+        db.query('SELECT * FROM Users WHERE google_id = ? OR email = ?', [sub, email], (err, results) => {
+            if (err) {
+                console.error('Error al buscar el usuario en la base de datos:', err);
+                return res.status(500).json({ message: 'Server error' });
+            }
+
+            if (results.length === 0) {
+                // Crear un nuevo usuario si no existe, con valores por defecto para first_name y last_name
+                db.query(
+                    'INSERT INTO Users (google_id, email, username, first_name, last_name, role) VALUES (?, ?, ?, ?, ?, "user")',
+                    [sub, email, username, given_name, family_name],
+                    (insertErr, insertResults) => {
+                        if (insertErr) {
+                            console.error('Error al crear el usuario:', insertErr);
+                            return res.status(500).json({ message: 'Server error' });
+                        }
+
+                        const user = {
+                            user_id: insertResults.insertId,
+                            role: 'user',
+                        };
+
+                        const token = jwt.sign({ id: user.user_id, role: user.role }, SECRET_KEY, { expiresIn: '1h' });
+
+                        res.json({ success: true, token });
+                    }
+                );
+            } else {
+                const user = results[0];
+                const token = jwt.sign({ id: user.user_id, role: user.role }, SECRET_KEY, { expiresIn: '1h' });
+
+                res.json({ success: true, token });
+            }
+        });
+    } catch (error) {
+        console.error('Error al verificar el token de Google:', error);
+        res.status(400).json({ message: 'Error verifying Google token' });
+    }
 });
+
+
+app.post('/create-checkout-session', verifySession, async (req, res) => {
+    console.log('Stripe Secret Key:', process.env.STRIPE_SECRET_KEY);
+    try {
+        const { items, client_id, discount } = req.body; // Obtener el descuento
+
+        // Crear la sesión de Stripe Checkout aplicando el descuento a cada artículo
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: items.map(item => ({
+                price_data: {
+                    currency: 'usd',
+                    product_data: {
+                        name: item.name,
+                    },
+                    // Aplicar el descuento a cada producto individual
+                    unit_amount: Math.round((item.price - (item.price * discount)) * 100), // Aplicar el descuento y convertir a centavos
+                },
+                quantity: item.quantity,
+            })),
+            mode: 'payment',
+            success_url: `http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `http://localhost:3000/cancel`,
+            automatic_tax: { enabled: true },
+        });
+
+        // Guardar la orden en la base de datos
+        const formattedDate = moment().format('YYYY-MM-DD HH:mm:ss');
+        const totalAmount = items.reduce((total, item) => total + (item.price * item.quantity), 0) * (1 - discount);
+        const query = 'INSERT INTO Orders (client_id, total_amount, status, order_date, stripe_session_id) VALUES (?, ?, "pending", ?, ?)';
+        db.query(query, [client_id, totalAmount, formattedDate, session.id], (err, orderResults) => {
+            if (err) {
+                console.error('Error inserting order:', err);
+                return res.status(500).send('Server error during order insertion');
+            }
+
+            const orderId = orderResults.insertId;
+
+            items.forEach(item => {
+                const itemQuery = 'INSERT INTO OrderItems (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)';
+                db.query(itemQuery, [orderId, item.product_id, item.quantity, item.price], (err) => {
+                    if (err) {
+                        console.error('Error inserting order item:', err);
+                        return res.status(500).send('Server error during order items insertion');
+                    }
+                });
+            });
+
+            // Responder con la URL de la sesión de Stripe
+            res.status(200).json({ url: session.url });
+        });
+
+    } catch (error) {
+        console.error('Error creating checkout session:', error);
+        res.status(500).send('Server error');
+    }
+});
+
 
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
@@ -399,23 +431,145 @@ app.post('/register', async (req, res) => {
     }
 });
 
+app.post('/reviews', verifySession, (req, res) => {
+    const { product_id, review_content, rating } = req.body;
+    const user_id = req.user.id;
+  
+    const query = 'INSERT INTO Reviews (user_id, product_id, review_content, rating) VALUES (?, ?, ?, ?)';
+    db.query(query, [user_id, product_id, review_content, rating], (err, results) => {
+      if (err) {
+        console.error('Error al agregar reseña:', err);
+        return res.status(500).json({ message: 'Error al agregar reseña' });
+      }
+      res.status(201).json({ success: true, message: 'Reseña agregada con éxito' });
+    });
+  });
+
+  app.get('/reviews/:productId', (req, res) => {
+    const { productId } = req.params;
+  
+    const query = 'SELECT r.*, u.username FROM Reviews r JOIN Users u ON r.user_id = u.user_id WHERE product_id = ?';
+    db.query(query, [productId], (err, results) => {
+      if (err) {
+        console.error('Error al obtener reseñas:', err);
+        return res.status(500).json({ message: 'Error al obtener reseñas' });
+      }
+      res.json(results);
+    });
+  });
+
+  app.post('/admin/coupons', (req, res) => {
+    const { discount, expiration_date, usage_limit } = req.body;
+    const code = generateRandomCode(); // Generar el código aleatorio
+
+    const query = 'INSERT INTO coupons (code, discount, expiration_date, usage_limit) VALUES (?, ?, ?, ?)';
+    db.query(query, [code, discount, expiration_date, usage_limit || null], (err, result) => {
+        if (err) {
+            console.error('Error al crear el cupón:', err);
+            return res.status(500).json({ message: 'Error al crear el cupón' });
+        }
+        res.status(201).json({ message: 'Cupón creado exitosamente', code });
+    });
+});
+
+app.post('/admin/coupons/batch', (req, res) => {
+    const { coupons } = req.body;
+
+    // Inserción de los cupones en batch
+    const query = 'INSERT INTO coupons (code, discount, expiration_date, usage_limit) VALUES ?';
+    const values = coupons.map(coupon => [coupon.code, coupon.discount, coupon.expiration_date, coupon.usage_limit]);
+
+    db.query(query, [values], (err, result) => {
+        if (err) {
+            console.error('Error al crear los cupones:', err);
+            return res.status(500).json({ message: 'Error al crear los cupones' });
+        }
+        res.status(201).json({ message: 'Cupones creados exitosamente' });
+    });
+});
+
+
+// Validar un cupón
+app.post('/coupons/validate', (req, res) => {
+    const { code } = req.body;
+
+    const query = 'SELECT * FROM coupons WHERE code = ? AND is_active = TRUE AND expiration_date >= CURDATE() AND (usage_limit IS NULL OR usage_limit > 0)';
+    db.query(query, [code], (err, results) => {
+        if (err) {
+            console.error('Error al validar el cupón:', err);
+            return res.status(500).json({ message: 'Error al validar el cupón' });
+        }
+
+        if (results.length === 0) {
+            return res.status(404).json({ message: 'Cupón inválido, expirado o sin uso disponible' });
+        }
+
+        res.json(results[0]);
+    });
+});
+
+// Aplicar un cupón (reducir el límite de uso)
+app.post('/coupons/use', (req, res) => {
+    const { code } = req.body;
+
+    const query = 'SELECT * FROM coupons WHERE code = ? AND is_active = TRUE AND expiration_date >= CURDATE() AND (usage_limit IS NULL OR usage_limit > 0)';
+    db.query(query, [code], (err, results) => {
+        if (err) {
+            console.error('Error al validar el cupón:', err);
+            return res.status(500).json({ message: 'Error al validar el cupón' });
+        }
+
+        if (results.length === 0) {
+            return res.status(404).json({ message: 'Cupón inválido o sin uso disponible' });
+        }
+
+        const coupon = results[0];
+        if (coupon.usage_limit !== null) {
+            const updateQuery = 'UPDATE coupons SET usage_limit = usage_limit - 1 WHERE coupon_id = ?';
+            db.query(updateQuery, [coupon.coupon_id], (err, updateResult) => {
+                if (err) {
+                    console.error('Error al actualizar el límite de uso del cupón:', err);
+                    return res.status(500).json({ message: 'Error al aplicar el cupón' });
+                }
+                res.status(200).json({ message: 'Cupón aplicado correctamente' });
+            });
+        } else {
+            res.status(200).json({ message: 'Cupón aplicado correctamente' });
+        }
+    });
+});
+  
+// Endpoint para actualizar el perfil del usuario
 app.put('/update-profile', verifySession, (req, res) => {
     const { user_id } = req.user;
-    const { newUsername, newEmail } = req.body;
+    const { newUsername, newEmail, newFirstName, newLastName, newBirthDate, newProfileImage } = req.body;
 
-    const query = 'UPDATE Users SET username = ?, email = ? WHERE user_id = ?';
-    db.query(query, [newUsername, newEmail, user_id], (err, results) => {
+    // Validación básica del correo electrónico
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (newEmail && !emailRegex.test(newEmail)) {
+        return res.status(400).json({ message: 'El formato del correo electrónico no es válido' });
+    }
+
+    const query = `
+        UPDATE Users 
+        SET username = ?, email = ?, first_name = ?, last_name = ?, birth_date = ?, profile_image = ?
+        WHERE user_id = ?
+    `;
+
+    db.query(query, [newUsername, newEmail, newFirstName, newLastName, newBirthDate, newProfileImage, user_id], (err, results) => {
         if (err) {
             console.error('Error al actualizar el perfil:', err);
             return res.status(500).json({ message: 'Error al actualizar el perfil' });
         }
 
-        const details = `Usuario actualizó su perfil: username = ${newUsername}, email = ${newEmail}`;
+        const details = `Usuario actualizó su perfil: username = ${newUsername}, email = ${newEmail}, first_name = ${newFirstName}, last_name = ${newLastName}`;
         registerActivity(user_id, 'Cambio de perfil', details);
 
         res.status(200).json({ success: true, message: 'Perfil actualizado exitosamente' });
     });
 });
+
+
 
 app.post('/perform-action', verifySession, (req, res) => {
     const { user_id } = req.user;
@@ -452,103 +606,6 @@ app.get('/notifications', verifySession, (req, res) => {
         }
         res.json(results);
     });
-});
-
-app.post('/create-paypal-order', verifySession, async (req, res) => {
-    console.log("create-paypal-order endpoint hit");
-    console.log("Request Body:", req.body);
-    
-    try {
-        // 1. Crear la orden en PayPal
-        const request = new paypal.orders.OrdersCreateRequest();
-        request.requestBody({
-            intent: 'CAPTURE',
-            purchase_units: [{
-                amount: {
-                    currency_code: 'USD',
-                    value: req.body.total
-                }
-            }]
-        });
-
-        const order = await paypalClient.execute(request);
-        console.log("PayPal Order Created:", order.result.id);
-
-        // 2. Crear la orden en tu base de datos
-        const { client_id, total, items, paymentMethod } = req.body;
-        const formattedDate = moment().format('YYYY-MM-DD HH:mm:ss');
-
-        const query = 'INSERT INTO Orders (client_id, total_amount, status, order_date) VALUES (?, ?, "processing", ?)';
-        db.query(query, [client_id, total, formattedDate], (err, orderResults) => {
-            if (err) {
-                console.error('Error inserting order:', err);
-                return res.status(500).send('Server error during order insertion');
-            }
-
-            const orderId = orderResults.insertId;
-
-            items.forEach(item => {
-                const itemQuery = 'INSERT INTO OrderItems (order_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)';
-                db.query(itemQuery, [orderId, item.product_id, item.quantity, item.price], (err) => {
-                    if (err) {
-                        console.error('Error inserting order item:', err);
-                        return res.status(500).send('Server error during order items insertion');
-                    }
-                });
-            });
-
-            // 3. Enviar la respuesta con el ID de la orden de PayPal y de la base de datos
-            res.status(201).json({ orderID: order.result.id, localOrderId: orderId });
-        });
-    } catch (error) {
-        console.error("Error creating PayPal order:", error);
-        res.status(500).send('Error creating PayPal order');
-    }
-});
-
-
-app.post('/capture-paypal-order', verifySession, async (req, res) => {
-    console.log("capture-paypal-order endpoint hit");
-    console.log("Order ID to Capture:", req.body.orderID);
-
-    const { orderID } = req.body;
-    const request = new paypal.orders.OrdersCaptureRequest(orderID);
-
-    try {
-        const capture = await paypalClient.execute(request);
-        console.log("PayPal Order Captured:", capture.result);
-
-        // Asume que el pago es exitoso
-        const token = req.headers['authorization'].split(' ')[1];
-        const decoded = jwt.verify(token, SECRET_KEY);
-
-        const user_id = decoded.id;
-
-        // Obtener el client_id usando el endpoint que ya tienes
-        const clientResponse = await axios.get(`http://localhost:3001/client-by-user/${user_id}`, {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        });
-
-        const client_id = clientResponse.data.client_id;
-
-        // Actualizar la orden en tu base de datos para marcarla como 'completed'
-        const updateOrderQuery = `UPDATE orders SET status = 'completed' WHERE order_id = ?`;
-
-        db.query(updateOrderQuery, [orderID], (err, result) => {
-            if (err) {
-                console.error('Error updating order status:', err);
-                return res.status(500).json({ error: 'Error updating order status' });
-            }
-
-            res.status(200).json({ success: true, orderID });
-        });
-
-    } catch (error) {
-        console.error("Error capturing PayPal order:", error);
-        res.status(500).send('Error capturing PayPal order');
-    }
 });
 
 
@@ -854,17 +911,35 @@ app.get('/users', verifySession, (req, res) => {
     });
 });
 
+// Endpoint para obtener los datos de perfil de un usuario por ID
 app.get('/users/:id', verifySession, (req, res) => {
     const { id } = req.params;
-    const query = 'SELECT user_id, username, email, created_at, role FROM Users WHERE user_id = ?';
+
+    console.log(`Obteniendo datos de usuario con ID: ${id}`); // Depuración
+
+    const query = `
+        SELECT user_id, username, email, created_at, role, first_name, last_name, birth_date, profile_image
+        FROM Users 
+        WHERE user_id = ?
+    `;
+
     db.query(query, [id], (err, results) => {
         if (err) {
             console.error('Error al ejecutar la consulta:', err);
-            return res.status(500).send('Server error');
+            return res.status(500).json({ message: 'Error en el servidor' });
         }
-        res.json(results[0]);
+
+        if (results.length === 0) {
+            console.log('Usuario no encontrado'); // Depuración
+            return res.status(404).json({ message: 'Usuario no encontrado' });
+        }
+
+        console.log('Resultados de usuario:', results[0]); // Depuración
+        res.status(200).json(results[0]);
     });
 });
+
+
 
 app.put('/users/:id', verifySession, (req, res) => {
     const { id } = req.params;
@@ -931,60 +1006,6 @@ app.post('/sales', verifySession, (req, res) => {
     });
 });
 
-app.get('/generate-user-report', verifySession, (req, res) => {
-    const { fields, filter } = req.query;
-
-    const defaultFields = ['user_id', 'username', 'email', 'created_at', 'role'];
-    const selectedFields = fields ? fields.split(',') : defaultFields;
-
-    let query = 'SELECT ' + selectedFields.join(', ') + ' FROM Users';
-    if (filter) {
-        query += ` WHERE ${filter}`;
-    }
-
-    db.query(query, (err, results) => {
-        if (err) {
-            console.error('Error al ejecutar la consulta:', err);
-            return res.status(500).send('Server error');
-        }
-
-        const doc = new PDFDocument();
-        const filePath = path.join(__dirname, 'user_report.pdf');
-        const stream = fs.createWriteStream(filePath);
-        doc.pipe(stream);
-
-        doc.fontSize(18).text('Informe de Usuarios', { align: 'center' });
-        doc.moveDown();
-
-        const tableTop = 100;
-        const itemHeight = 20;
-
-        doc.fontSize(12);
-        selectedFields.forEach((field, index) => {
-            doc.text(field.replace('_', ' ').toUpperCase(), 50 + index * 100, tableTop);
-        });
-
-        results.forEach((user, i) => {
-            const y = tableTop + (i + 1) * itemHeight;
-            selectedFields.forEach((field, index) => {
-                doc.text(user[field], 50 + index * 100, y);
-            });
-        });
-
-        doc.end();
-
-        stream.on('finish', () => {
-            res.download(filePath, 'user_report.pdf', (err) => {
-                if (err) {
-                    console.error('Error al descargar el archivo:', err);
-                    res.status(500).send('Server error');
-                } else {
-                    fs.unlinkSync(filePath);
-                }
-            });
-        });
-    });
-});
 
 app.get('/generate-financial-report', verifySession, (req, res) => {
     const { start_date, end_date } = req.query;
@@ -1184,66 +1205,47 @@ app.delete('/expenses/:id', verifySession, (req, res) => {
 });
 
 
-app.get('/generate-client-report', verifySession, (req, res) => {
-    const { start_date, end_date } = req.query;
+const reportsDirectoryProducts = path.join(__dirname, 'reports-products');
+if (!fs.existsSync(reportsDirectoryProducts)) {
+    fs.mkdirSync(reportsDirectoryProducts);
+}
 
-    // Convertir las fechas en objetos moment.js
-    const startDate = moment(start_date);
-    const endDate = moment(end_date);
+// Configura el cron job para que se ejecute diariamente a medianoche
+cron.schedule('10 * * * *', async () => { // Ejecuta diariamente a medianoche
+    try {
+        console.log('Generando reporte automático de productos...');
 
-    console.log('Start Date:', start_date);
-    console.log('End Date:', end_date);
+        const token = 'tu_token_aqui'; // Cambia esto por tu token real
+        const queryString = new URLSearchParams({
+            fields: 'name,description,price,stock,category',
+            filter: ''
+        }).toString();
 
-    const clientQuery = `
-        SELECT user_id, name, address, contact_info, client_type
-        FROM Clients
-        WHERE created_at BETWEEN ? AND ?
-    `;
-
-    const clientTypeQuery = `
-        SELECT client_type, COUNT(*) AS count
-        FROM Clients
-        WHERE created_at BETWEEN ? AND ?
-        GROUP BY client_type
-    `;
-
-    db.query(clientQuery, [start_date, end_date], (err, clientResults) => {
-        if (err) return res.status(500).send('Error fetching clients');
-
-        db.query(clientTypeQuery, [start_date, end_date], (err, clientTypeResults) => {
-            if (err) return res.status(500).send('Error fetching client types');
-
-            const clientReport = {
-                clients: clientResults,
-                clientTypes: clientTypeResults,
-            };
-
-            res.json(clientReport);
+        const response = await axios.get(`http://localhost:3001/generate-product-report?${queryString}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            responseType: 'arraybuffer' // Usa 'arraybuffer' para manejar el PDF
         });
-    });
+
+        // Guarda el PDF en el directorio de reportes de productos
+        const fileName = `product_report_${new Date().toISOString().replace(/[:.]/g, '-')}.pdf`;
+        const filePath = path.join(reportsDirectoryProducts, fileName);
+        fs.writeFileSync(filePath, response.data);
+        console.log(`Reporte generado y guardado como ${fileName}`);
+    } catch (error) {
+        console.error('Error generando el reporte automático de productos:', error);
+    }
 });
 
-app.get('/generate-ventas-report', verifySession, (req, res) => {
-    const { fields, description, start_date, end_date } = req.query;
+// Endpoint para generar reportes de productos
+app.get('/generate-product-report', (req, res) => {
+    const { fields, filter } = req.query;
 
-    const defaultFields = ['i.invoice_id', 'ii.description', 'ii.quantity', 'ii.unit_price'];
+    const defaultFields = ['name', 'description', 'price', 'stock', 'category'];
     const selectedFields = fields ? fields.split(',') : defaultFields;
 
-    let query = `
-        SELECT ${selectedFields.join(', ')}
-        FROM invoiceitems ii
-        JOIN invoices i ON ii.invoice_id = i.invoice_id
-        WHERE 1=1
-    `;
-
-    if (description) {
-        query += ` AND ii.description LIKE '%${description}%'`;
-    }
-    if (start_date) {
-        query += ` AND i.issue_date >= '${start_date}'`;
-    }
-    if (end_date) {
-        query += ` AND i.issue_date <= '${end_date}'`;
+    let query = 'SELECT ' + selectedFields.join(', ') + ' FROM Products';
+    if (filter) {
+        query += ` WHERE ${filter}`;
     }
 
     db.query(query, (err, results) => {
@@ -1252,98 +1254,743 @@ app.get('/generate-ventas-report', verifySession, (req, res) => {
             return res.status(500).send('Server error');
         }
 
-        const doc = new PDFDocument();
-        const filePath = path.join(__dirname, 'sales_report.pdf');
+        const doc = new PDFDocument({ margin: 50 });
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const fileName = `product_report_${timestamp}.pdf`;
+        const filePath = path.join(reportsDirectoryProducts, fileName);
         const stream = fs.createWriteStream(filePath);
         doc.pipe(stream);
 
-        doc.fontSize(18).text('Informe de Ventas', { align: 'center' });
-        doc.moveDown();
+        // Encabezado del documento
+        doc.fontSize(16).text('Informe de Productos', { align: 'center', underline: true });
+        doc.moveDown(1);
 
+        // Configuración de la tabla
         const tableTop = 100;
-        const itemHeight = 20;
+        const columnWidth = 100; // Ajusta el ancho de las columnas si es necesario
+        const totalWidth = selectedFields.length * columnWidth; // Ancho total de la tabla
+        let currentY = tableTop;
 
-        doc.fontSize(12);
+        // Encabezados de la tabla
+        doc.fontSize(10).font('Helvetica-Bold');
         selectedFields.forEach((field, index) => {
-            doc.text(field.replace('_', ' ').toUpperCase(), 50 + index * 100, tableTop);
+            doc.text(field.replace('_', ' ').toUpperCase(), 50 + index * columnWidth, currentY, {
+                width: columnWidth,
+                align: 'center'
+            });
         });
 
-        results.forEach((item, i) => {
-            const y = tableTop + (i + 1) * itemHeight;
+        // Línea divisoria de encabezado
+        currentY += 20;
+        doc.moveTo(50, currentY)
+           .lineTo(50 + totalWidth, currentY)
+           .stroke();
+
+        // Filas de la tabla
+        doc.font('Helvetica').fontSize(9);
+        results.forEach((product) => {
+            let maxLineCount = 1;
+
             selectedFields.forEach((field, index) => {
-                doc.text(item[field], 50 + index * 100, y);
+                const text = product[field] ? product[field].toString() : '';
+                const lines = doc.heightOfString(text, {
+                    width: columnWidth,
+                    align: 'center'
+                }) / doc.currentLineHeight();
+
+                if (lines > maxLineCount) {
+                    maxLineCount = lines;
+                }
             });
+
+            selectedFields.forEach((field, index) => {
+                const text = product[field] ? product[field].toString() : '';
+                doc.text(text, 50 + index * columnWidth, currentY, {
+                    width: columnWidth,
+                    align: 'center'
+                });
+            });
+
+            currentY += maxLineCount * doc.currentLineHeight() + 8;
+
+            // Línea divisoria después de cada fila
+            doc.moveTo(50, currentY)
+               .lineTo(50 + totalWidth, currentY)
+               .stroke();
+        });
+
+        // Espacio adicional antes del pie de página
+        currentY += 20;
+
+        // Pie de página
+        doc.fontSize(8).text(`Fecha: ${new Date().toLocaleDateString()}`, 50, currentY, {
+            align: 'right'
         });
 
         doc.end();
 
         stream.on('finish', () => {
-            res.download(filePath, 'sales_report.pdf', (err) => {
+            res.download(filePath, fileName, (err) => {
                 if (err) {
                     console.error('Error al descargar el archivo:', err);
                     res.status(500).send('Server error');
-                } else {
-                    fs.unlinkSync(filePath);
                 }
             });
         });
     });
 });
 
-app.get('/generate-inventory-report', verifySession, (req, res) => {
-    const { fields, name, category, price_min, price_max } = req.query;
 
-    const selectedFields = fields ? fields.split(',') : ['product_id', 'name', 'stock', 'price'];
-
-    let query = 'SELECT ' + selectedFields.join(', ') + ' FROM products WHERE 1=1';
-
-    if (name) {
-        query += ` AND name LIKE '%${name}%'`;
-    }
-    if (category) {
-        query += ` AND category = '${category}'`;
-    }
-    if (price_min && price_max) {
-        query += ` AND price BETWEEN ${price_min} AND ${price_max}`;
-    }
-
-    db.query(query, (err, products) => {
+// Endpoint para listar reportes pasados
+app.get('/past-reports-products', (req, res) => {
+    fs.readdir(reportsDirectoryProducts, (err, files) => {
         if (err) {
-            console.error('Error fetching products:', err);
+            console.error('Error al leer el directorio de reportes:', err);
             return res.status(500).send('Server error');
         }
 
-        const doc = new PDFDocument();
-        const filePath = path.join(__dirname, 'inventory_report.pdf');
+        // Genera una lista de reportes con nombre y URL
+        const reports = files.map(file => {
+            // Extrae la fecha del nombre del archivo para mostrarla en el frontend
+            const dateMatch = file.match(/product_report_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)/);
+            const date = dateMatch ? dateMatch[1].replace(/-/g, ':') : 'Desconocida'; // Cambia ':' por '-' para formato amigable
 
-        doc.pipe(fs.createWriteStream(filePath));
-
-        doc.fontSize(25).text('Reporte de Inventario', {
-            align: 'center'
+            return {
+                id: file,
+                name: file,
+                date: date,
+                url: `/reports-products/${file}` // Asegúrate de que la ruta sea correcta
+            };
         });
 
-        doc.moveDown();
+        res.json(reports);
+    });
+});
 
-        products.forEach(product => {
-            selectedFields.forEach(field => {
-                doc.fontSize(12).text(`${field.replace('_', ' ').toUpperCase()}: ${product[field]}`);
+// Servir archivos estáticos desde el directorio de reportes
+app.use('/reports-products', express.static(reportsDirectoryProducts));
+
+const reportsDirectory = path.join(__dirname, 'reports');
+if (!fs.existsSync(reportsDirectory)) {
+    fs.mkdirSync(reportsDirectory);
+}
+
+app.get('/generate-inventory-report', (req, res) => {
+    const { fields, name, category, price_min, price_max, format } = req.query;
+    const selectedFields = fields.split(',');
+
+    // Consulta de productos a la base de datos utilizando db.query con callbacks
+    db.query(`
+        SELECT ${selectedFields.join(', ')} FROM products 
+        WHERE name LIKE ? AND category LIKE ? 
+        AND price BETWEEN ? AND ?
+    `, [`%${name}%`, `%${category}%`, price_min, price_max], (err, products) => {
+        if (err) {
+            console.error('Error al ejecutar la consulta:', err);
+            return res.status(500).send('Error en el servidor');
+        }
+
+        if (format === 'pdf') {
+            const doc = new PDFDocument();
+            const fileName = `inventory_report_${new Date().toISOString().replace(/[:.]/g, '-')}.pdf`;
+            const filePath = path.join(reportsDirectory, fileName);
+            const stream = fs.createWriteStream(filePath);
+            doc.pipe(stream);
+
+            // Cabecera del reporte
+            doc.fontSize(18).text('Informe de Inventario', { align: 'center' });
+            doc.moveDown(2);
+
+            // Tabla de productos
+            const tableTop = 100;
+            const columnWidth = 150;
+            let currentY = tableTop;
+
+            doc.fontSize(12).font('Helvetica-Bold');
+            selectedFields.forEach((field, index) => {
+                doc.text(field.toUpperCase(), 50 + index * columnWidth, currentY, { width: columnWidth });
             });
-            doc.moveDown();
+
+            doc.moveTo(50, currentY + 20).lineTo(50 + selectedFields.length * columnWidth, currentY + 20).stroke();
+
+            doc.font('Helvetica').fontSize(10);
+            products.forEach((product) => {
+                selectedFields.forEach((field, index) => {
+                    const text = product[field] ? product[field].toString() : '';
+                    doc.text(text, 50 + index * columnWidth, currentY + 30, { width: columnWidth });
+                });
+                currentY += 30;
+            });
+
+            doc.end();
+            stream.on('finish', () => res.download(filePath));
+
+        } else if (format === 'csv') {
+            const fields = selectedFields.map(field => field.toUpperCase());
+            const parser = new Parser({ fields });
+            const csv = parser.parse(products);
+            const fileName = `inventory_report_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+            const filePath = path.join(reportsDirectory, fileName);
+            fs.writeFileSync(filePath, csv);
+            res.download(filePath);
+
+        } else if (format === 'xlsx') {
+            const workbook = new ExcelJS.Workbook();
+            const worksheet = workbook.addWorksheet('Reporte de Inventario');
+            worksheet.columns = selectedFields.map(field => ({ header: field.toUpperCase(), key: field, width: 20 }));
+
+            products.forEach((product) => worksheet.addRow(product));
+            const fileName = `inventory_report_${new Date().toISOString().replace(/[:.]/g, '-')}.xlsx`;
+            const filePath = path.join(reportsDirectory, fileName);
+            workbook.xlsx.writeFile(filePath).then(() => {
+                res.download(filePath);
+            });
+
+        } else {
+            res.status(400).send('Formato no soportado');
+        }
+    });
+});
+
+module.exports = app;
+const reportsDirectoryUsers = path.join(__dirname, 'reports-users');
+if (!fs.existsSync(reportsDirectoryUsers)) {
+    fs.mkdirSync(reportsDirectoryUsers);
+}
+
+// Endpoint para generar reportes en PDF, CSV o Excel
+app.get('/generate-user-report', verifySession, (req, res) => {
+    const { fields, filter, format = 'pdf' } = req.query; // Formato por defecto 'pdf'
+
+    const defaultFields = ['username', 'email', 'created_at'];
+    const selectedFields = fields ? fields.split(',') : defaultFields;
+
+    let query = 'SELECT ' + selectedFields.join(', ') + ' FROM Users';
+    if (filter) {
+        query += ` WHERE ${filter}`;
+    }
+
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('Error al ejecutar la consulta:', err);
+            return res.status(500).send('Server error');
+        }
+
+        if (format === 'pdf') {
+            // Generar PDF
+            const doc = new PDFDocument({ margin: 50 });
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `user_report_${timestamp}.pdf`;
+            const filePath = path.join(reportsDirectoryUsers, fileName);
+            const stream = fs.createWriteStream(filePath);
+            doc.pipe(stream);
+
+            // Encabezado del documento
+            doc.fontSize(18).text('Informe de Usuarios', { align: 'center', underline: true });
+            doc.moveDown(2);
+
+            // Configuración de la tabla
+            const tableTop = 100;
+            const columnWidth = 150;
+            let currentY = tableTop;
+
+            // Encabezados de la tabla
+            doc.fontSize(12).font('Helvetica-Bold');
+            selectedFields.forEach((field, index) => {
+                doc.text(field.replace('_', ' ').toUpperCase(), 50 + index * columnWidth, currentY, {
+                    width: columnWidth,
+                    align: 'center'
+                });
+            });
+
+            // Línea divisoria de encabezado
+            currentY += 20;
+            doc.moveTo(50, currentY)
+                .lineTo(50 + selectedFields.length * columnWidth, currentY)
+                .stroke();
+
+            // Filas de la tabla
+            doc.font('Helvetica').fontSize(10);
+            results.forEach((user) => {
+                selectedFields.forEach((field, index) => {
+                    const text = user[field] ? user[field].toString() : '';
+                    doc.text(text, 50 + index * columnWidth, currentY, {
+                        width: columnWidth,
+                        align: 'center'
+                    });
+                });
+                currentY += doc.currentLineHeight() + 10;
+
+                // Línea divisoria después de cada fila
+                doc.moveTo(50, currentY)
+                    .lineTo(50 + selectedFields.length * columnWidth, currentY)
+                    .stroke();
+            });
+
+            // Pie de página
+            currentY += 20;
+            doc.fontSize(10).text(`Fecha: ${new Date().toLocaleDateString()}`, 50, currentY, { align: 'right' });
+            doc.end();
+
+            stream.on('finish', () => {
+                res.download(filePath, fileName, (err) => {
+                    if (err) {
+                        console.error('Error al descargar el archivo:', err);
+                        res.status(500).send('Server error');
+                    }
+                });
+            });
+        } else if (format === 'csv') {
+            // Generar CSV
+            const fields = selectedFields.map(field => field.replace('_', ' '));
+            const parser = new Parser({ fields });
+            const csv = parser.parse(results);
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `user_report_${timestamp}.csv`;
+            const filePath = path.join(reportsDirectoryUsers, fileName);
+
+            fs.writeFile(filePath, csv, (err) => {
+                if (err) {
+                    console.error('Error al generar CSV:', err);
+                    return res.status(500).send('Server error');
+                }
+                res.download(filePath, fileName, (err) => {
+                    if (err) {
+                        console.error('Error al descargar CSV:', err);
+                        res.status(500).send('Server error');
+                    }
+                });
+            });
+        } else if (format === 'excel') {
+            // Generar Excel
+            const workbook = new ExcelJS.Workbook();
+            const worksheet = workbook.addWorksheet('Reporte de Usuarios');
+
+            // Añadir encabezados
+            worksheet.columns = selectedFields.map(field => ({
+                header: field.replace('_', ' ').toUpperCase(),
+                key: field,
+                width: 20
+            }));
+
+            // Añadir datos
+            results.forEach(user => {
+                worksheet.addRow(user);
+            });
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `user_report_${timestamp}.xlsx`;
+            const filePath = path.join(reportsDirectoryUsers, fileName);
+
+            workbook.xlsx.writeFile(filePath)
+                .then(() => {
+                    res.download(filePath, fileName, (err) => {
+                        if (err) {
+                            console.error('Error al descargar Excel:', err);
+                            res.status(500).send('Server error');
+                        }
+                    });
+                })
+                .catch((err) => {
+                    console.error('Error al generar Excel:', err);
+                    res.status(500).send('Server error');
+                });
+        } else {
+            return res.status(400).send('Formato no soportado');
+        }
+    });
+});
+
+// Endpoint para listar reportes pasados
+app.get('/past-reports-users', verifySession, (req, res) => {
+    fs.readdir(reportsDirectoryUsers, (err, files) => {
+        if (err) {
+            console.error('Error al leer el directorio de reportes:', err);
+            return res.status(500).send('Server error');
+        }
+
+        // Genera una lista de reportes con nombre y URL
+        const reports = files.map(file => {
+            // Extrae la fecha del nombre del archivo para mostrarla en el frontend
+            const dateMatch = file.match(/user_report_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)/);
+            const date = dateMatch ? dateMatch[1].replace(/-/g, ':') : 'Desconocida';
+
+            return {
+                id: file,
+                name: file,
+                date: date,
+                url: `/reports-users/${file}`
+            };
+        });
+
+        res.json(reports);
+    });
+});
+
+// Servir archivos estáticos desde el directorio de reportes
+app.use('/reports-users', express.static(reportsDirectoryUsers));
+
+module.exports = app;
+
+// Directorio de reportes de clientes
+const reportsDirectoryClients = path.join(__dirname, 'reports-clients');
+if (!fs.existsSync(reportsDirectoryClients)) {
+    fs.mkdirSync(reportsDirectoryClients);
+}
+
+// Configura el cron job para que se ejecute diariamente
+cron.schedule('10 10 * * *', async () => {
+    try {
+        console.log('Generando reporte automático...');
+
+        const token = 'tu_token_aqui'; 
+        const queryString = new URLSearchParams({
+            fields: 'name,address,contact_info', 
+            filter: '',
+            start_date: '', 
+            end_date: ''
+        }).toString();
+
+        const response = await axios.get(`http://localhost:3001/generate-client-report?${queryString}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            responseType: 'arraybuffer' // Usa 'arraybuffer' para manejar el PDF
+        });
+
+    
+    } catch (error) {
+        console.error('Error generando el reporte automático:', error);
+    }
+});
+
+// Endpoint para generar reportes de clientes
+app.get('/generate-client-report', (req, res) => {
+    const { fields, filter, start_date, end_date } = req.query;
+
+    const defaultFields = ['name', 'address', 'contact_info'];
+    const selectedFields = fields ? fields.split(',') : defaultFields;
+
+    let query = 'SELECT ' + selectedFields.join(', ') + ' FROM Clients';
+    if (filter) {
+        query += ` WHERE ${filter}`;
+    }
+    if (start_date) {
+        query += ` AND date >= '${start_date}'`;
+    }
+    if (end_date) {
+        query += ` AND date <= '${end_date}'`;
+    }
+
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('Error al ejecutar la consulta:', err);
+            return res.status(500).send('Server error');
+        }
+
+        if (results.length === 0) {
+            return res.status(404).send('No data found');
+        }
+
+        const doc = new PDFDocument({ margin: 50 });
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const fileName = `client_report_${timestamp}.pdf`;
+        const filePath = path.join(reportsDirectoryClients, fileName);
+        const stream = fs.createWriteStream(filePath);
+        doc.pipe(stream);
+
+        // Encabezado del documento
+        doc.fontSize(18).text('Informe de Clientes', { align: 'center', underline: true });
+        doc.moveDown(2);
+
+        // Configuración de la tabla
+        const tableTop = 100;
+        const tableLeft = 50;
+        const columnWidth = 150;
+        let currentY = tableTop;
+
+        // Encabezados de la tabla
+        doc.fontSize(12).font('Helvetica-Bold');
+        selectedFields.forEach((field, index) => {
+            doc.text(field.replace('_', ' ').toUpperCase(), tableLeft + index * columnWidth, currentY, {
+                width: columnWidth,
+                align: 'center'
+            });
+        });
+
+        // Líneas de encabezado
+        currentY += 20;
+        doc.moveTo(tableLeft, currentY)
+           .lineTo(tableLeft + selectedFields.length * columnWidth, currentY)
+           .stroke();
+
+        // Filas de la tabla
+        doc.font('Helvetica').fontSize(10);
+
+        results.forEach((item) => {
+            let maxLineCount = 1;
+
+            selectedFields.forEach((field, index) => {
+                const text = item[field] ? item[field].toString() : '';
+                const lines = doc.heightOfString(text, {
+                    width: columnWidth,
+                    align: 'center'
+                }) / doc.currentLineHeight();
+
+                if (lines > maxLineCount) {
+                    maxLineCount = lines;
+                }
+            });
+
+            selectedFields.forEach((field, index) => {
+                const text = item[field] ? item[field].toString() : '';
+                doc.text(text, tableLeft + index * columnWidth, currentY, {
+                    width: columnWidth,
+                    align: 'center'
+                });
+            });
+
+            currentY += maxLineCount * doc.currentLineHeight() + 10;
+
+            // Líneas divisorias
+            doc.moveTo(tableLeft, currentY)
+               .lineTo(tableLeft + selectedFields.length * columnWidth, currentY)
+               .stroke();
+        });
+
+        // Espacio adicional antes de la fecha
+        currentY += 20;
+
+        // Pie de página
+        doc.fontSize(10).text(`Fecha: ${new Date().toLocaleDateString()}`, tableLeft, currentY, {
+            align: 'right'
         });
 
         doc.end();
 
-        doc.on('end', () => {
-            res.download(filePath, 'inventory_report.pdf', (err) => {
+        stream.on('finish', () => {
+            res.download(filePath, fileName, (err) => {
                 if (err) {
-                    console.error('Error downloading the report:', err);
-                    return res.status(500).send('Server error');
+                    console.error('Error al descargar el archivo:', err);
+                    res.status(500).send('Server error');
                 }
-                fs.unlinkSync(filePath); // Eliminar el archivo después de ser descargado
+                // Nota: El archivo se guarda en el directorio de reportes pasados, no se elimina aquí
             });
         });
     });
 });
+
+// Endpoint para listar reportes pasados
+app.get('/past-reports-clients', (req, res) => {
+    fs.readdir(reportsDirectoryClients, (err, files) => {
+        if (err) {
+            console.error('Error al leer el directorio de reportes:', err);
+            return res.status(500).send('Server error');
+        }
+
+        // Genera una lista de reportes con nombre y URL
+        const reports = files.map(file => {
+            // Extrae la fecha del nombre del archivo para mostrarla en el frontend
+            const dateMatch = file.match(/client_report_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)/);
+            const date = dateMatch ? dateMatch[1].replace(/-/g, ':') : 'Desconocida'; // Cambia ':' por '-' para formato amigable
+
+            return {
+                id: file,
+                name: file,
+                date: date,
+                url: `/reports-clients/${file}` // Asegúrate de que la ruta sea correcta
+            };
+        });
+
+        res.json(reports);
+    });
+});
+
+// Servir archivos estáticos desde el directorio de reportes
+app.use('/reports-clients', express.static(reportsDirectoryClients));
+
+
+// Directorio de reportes ventas
+const reportsDirectorySales = path.join(__dirname, 'reports-sales');
+if (!fs.existsSync(reportsDirectorySales)) {
+    fs.mkdirSync(reportsDirectorySales);
+}
+
+// Configura el cron job para que se ejecute diariamente
+cron.schedule('10 10 * * *', async () => {
+    try {
+        console.log('Generando reporte automático...');
+
+        
+        const token = 'tu_token_aqui'; 
+        const queryString = new URLSearchParams({
+            fields: 'description,quantity,unit_price', 
+            filter: '',
+            start_date: '', 
+            end_date: ''
+        }).toString();
+
+        const response = await axios.get(`http://localhost:3001/generate-ventas-report?${queryString}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            responseType: 'blob'
+        });
+
+        if (response.status === 200) {
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `sales_report_${timestamp}.pdf`;
+            const filePath = path.join(reportsDirectorySales, fileName);
+
+            // Guarda el archivo
+            fs.writeFileSync(filePath, response.data);
+            console.log(`Reporte generado y guardado como ${fileName}`);
+        } else {
+            console.error('Error en la respuesta:', response);
+        }
+    } catch (error) {
+        console.error('Error generando el reporte automático:', error);
+    }
+});
+
+
+app.get('/generate-ventas-report', (req, res) => {
+    const { fields, filter, start_date, end_date } = req.query;
+
+    const defaultFields = ['description', 'quantity', 'unit_price'];
+    const selectedFields = fields ? fields.split(',') : defaultFields;
+
+    let query = 'SELECT ' + selectedFields.join(', ') + ' FROM SaleItems';
+    if (filter) {
+        query += ` WHERE ${filter}`;
+    }
+    if (start_date) {
+        query += ` AND date >= '${start_date}'`;
+    }
+    if (end_date) {
+        query += ` AND date <= '${end_date}'`;
+    }
+
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('Error al ejecutar la consulta:', err);
+            return res.status(500).send('Server error');
+        }
+
+        const doc = new PDFDocument({ margin: 50 });
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const fileName = `sales_report_${timestamp}.pdf`;
+        const filePath = path.join(reportsDirectorySales, fileName);
+        const stream = fs.createWriteStream(filePath);
+        doc.pipe(stream);
+
+        // Encabezado del documento
+        doc.fontSize(18).text('Informe de Ventas', { align: 'center', underline: true });
+        doc.moveDown(2);
+
+        // Configuración de la tabla
+        const tableTop = 100;
+        const tableLeft = 50;
+        const columnWidth = 150;
+        let currentY = tableTop;
+
+        // Encabezados de la tabla
+        doc.fontSize(12).font('Helvetica-Bold');
+        selectedFields.forEach((field, index) => {
+            doc.text(field.replace('_', ' ').toUpperCase(), tableLeft + index * columnWidth, currentY, {
+                width: columnWidth,
+                align: 'center'
+            });
+        });
+
+        // Líneas de encabezado
+        currentY += 20;
+        doc.moveTo(tableLeft, currentY)
+           .lineTo(tableLeft + selectedFields.length * columnWidth, currentY)
+           .stroke();
+
+        // Filas de la tabla
+        doc.font('Helvetica').fontSize(10);
+
+        results.forEach((item, i) => {
+            let maxLineCount = 1;
+
+            selectedFields.forEach((field, index) => {
+                const text = item[field] ? item[field].toString() : '';
+                const lines = doc.heightOfString(text, {
+                    width: columnWidth,
+                    align: 'center'
+                }) / doc.currentLineHeight();
+
+                if (lines > maxLineCount) {
+                    maxLineCount = lines;
+                }
+            });
+
+            selectedFields.forEach((field, index) => {
+                const text = item[field] ? item[field].toString() : '';
+                doc.text(text, tableLeft + index * columnWidth, currentY, {
+                    width: columnWidth,
+                    align: 'center'
+                });
+            });
+
+            currentY += maxLineCount * doc.currentLineHeight() + 10;
+
+            // Líneas divisorias
+            doc.moveTo(tableLeft, currentY)
+               .lineTo(tableLeft + selectedFields.length * columnWidth, currentY)
+               .stroke();
+        });
+
+        // Espacio adicional antes de la fecha
+        currentY += 20;
+
+        // Pie de página
+        doc.fontSize(10).text(`Fecha: ${new Date().toLocaleDateString()}`, tableLeft, currentY, {
+            align: 'right'
+        });
+
+        doc.end();
+
+        stream.on('finish', () => {
+            res.download(filePath, fileName, (err) => {
+                if (err) {
+                    console.error('Error al descargar el archivo:', err);
+                    res.status(500).send('Server error');
+                }
+                // Nota: El archivo se guarda en el directorio de reportes pasados, no se elimina aquí
+            });
+        });
+    });
+});
+
+
+// Endpoint para listar reportes pasados
+app.get('/past-reports-sales', (req, res) => {
+    fs.readdir(reportsDirectorySales, (err, files) => {
+        if (err) {
+            console.error('Error al leer el directorio de reportes:', err);
+            return res.status(500).send('Server error');
+        }
+
+        // Genera una lista de reportes con nombre y URL
+        const reports = files.map(file => {
+            // Extrae la fecha del nombre del archivo para mostrarla en el frontend
+            const dateMatch = file.match(/sales_report_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)/);
+            const date = dateMatch ? dateMatch[1].replace(/-/g, ':') : 'Desconocida'; // Cambia ':' por '-' para formato amigable
+
+            return {
+                id: file,
+                name: file,
+                date: date,
+                url: `/reports-sales/${file}` // Asegúrate de que la ruta sea correcta
+            };
+        });
+
+        res.json(reports);
+    });
+});
+
+// Servir archivos estáticos desde el directorio de reportes
+app.use('/reports-sales', express.static(reportsDirectorySales));
+
 
 app.get('/suppliers', verifySession, (req, res) => {
     db.query('SELECT * FROM Suppliers', (err, results) => {
@@ -1474,7 +2121,7 @@ app.put('/admin/orders/:orderId/approve', verifySession, (req, res) => {
 
         const getOrderDetailsQuery = `
             SELECT o.*, c.name AS client_name, c.email, c.address, c.contact_info,
-                   oi.product_id, p.name AS product_name, oi.quantity, oi.unit_price, p.discount
+                   oi.product_id, p.name AS product_name, oi.quantity, oi.unit_price, p.discount, o.stripe_session_id
             FROM orders o
             JOIN clients c ON o.client_id = c.client_id
             JOIN orderitems oi ON o.order_id = oi.order_id
