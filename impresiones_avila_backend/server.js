@@ -201,10 +201,11 @@ const registerActivity = (userId, action, details) => {
         }
     });
 };
+//cod
 
-const verifySession = (req, res, next) => {
+function verifySession(req, res, next) {
     const token = req.headers['authorization']?.split(' ')[1];
-    console.log('Token recibido:', token); 
+    console.log('Token recibido:', token);
     if (!token) {
         return res.status(401).json({ message: 'Access token is missing or invalid' });
     }
@@ -223,7 +224,7 @@ const verifySession = (req, res, next) => {
             next();
         });
     });
-};
+}
 
 app.post("/api/orders", createOrder);
 app.post("/api/orders/:orderID/capture", captureOrder);
