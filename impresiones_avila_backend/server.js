@@ -22,11 +22,6 @@ const app = express();
 const base = "https://api-m.sandbox.paypal.com";
 const SECRET_KEY = 'amovertele';
 
-const PORT = process.env.PORT || 3000; // Usa el puerto proporcionado por Render o un puerto predeterminado
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
-
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
@@ -46,9 +41,13 @@ const upload = multer({ storage });
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-const urlDB = 'mysql://root:RlQUaykaxkfyHYnBkemLxWDauKIHAgfM@mysql.railway.internal:3306/railway'
-
-const db = mysql.createConnection(urlDB);
+const db = mysql.createConnection({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME
+});
 
 db.connect(err => {
     if (err) {
